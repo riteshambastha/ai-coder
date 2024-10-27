@@ -1,0 +1,594 @@
+// src/App.tsx
+import { useState } from 'react';
+import { FolderOpen, Send, Settings, File, ChevronRight, ChevronDown } from 'lucide-react';
+
+// Types
+interface FileSystemHandle {
+  kind: 'file' | 'directory';
+  name: string;
+}
+
+interface FileSystemFileHandle extends FileSystemHandle {
+  kind: 'file';
+  getFile(): Promise<File>;
+  createWritable(): Promise<FileSystemWritableFileStream>;
+}
+
+interface FileSystemDirectoryHandle extends FileSystemHandle {
+  kind: 'directory';
+  values(): AsyncIterableIterator<FileSystemHandle>;
+  getDirectoryHandle(name: string): Promise<FileSystemDirectoryHandle>;
+  getFileHandle(name: string): Promise<FileSystemFileHandle>;
+}
+
+interface FileSystemWritableFileStream extends WritableStream {
+  write(data: string | ArrayBuffer | ArrayBufferView | Blob): Promise<void>;
+  seek(position: number): Promise<void>;
+  truncate(size: number): Promise<void>;
+}
+
+// Add this with your other interfaces
+interface ChatMessage {
+  id: string;
+  timestamp: string;
+  prompt: string;
+  response: string;
+  filePath?: string; // To track which file the chat was about
+}
+
+// Declare global window interface
+declare global {
+  interface Window {
+    showDirectoryPicker(): Promise<FileSystemDirectoryHandle>;
+    showOpenFilePicker(): Promise<FileSystemFileHandle[]>;
+    showSaveFilePicker(): Promise<FileSystemFileHandle>;
+  }
+}
+
+interface FileStructure {
+  name: string;
+  type: 'file' | 'directory';
+  path: string;
+  content?: string;
+  children?: FileStructure[];
+}
+
+
+
+type AIService = 'openai' | 'claude';
+
+function App() {
+  const [fileStructure, setFileStructure] = useState<FileStructure[]>([]);
+  const [selectedFile, setSelectedFile] = useState<FileStructure | null>(null);
+  const [fileContent, setFileContent] = useState<string>('');
+  const [prompt, setPrompt] = useState('');
+  const [response, setResponse] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [selectedService, setSelectedService] = useState<AIService>('claude');
+  const [apiKeys, setApiKeys] = useState({
+    openai: import.meta.env.VITE_OPENAI_API_KEY || localStorage.getItem('openai_api_key') || '',
+    claude: import.meta.env.VITE_CLAUDE_API_KEY || localStorage.getItem('claude_api_key') || ''
+  });
+  const [showSettings, setShowSettings] = useState(false);
+
+  // Add this with your other state declarations
+  const [chatHistory, setChatHistory] = useState<ChatMessage[]>(() => {
+    const saved = localStorage.getItem('chatHistory');
+    return saved ? JSON.parse(saved) : [];
+  });
+
+  const handleDirectorySelect = async () => {
+    // Check if there's existing chat history
+    if (chatHistory.length > 0) {
+      const confirmed = window.confirm(
+        'Opening a new folder will clear the current chat history. Are you sure you want to continue?'
+      );
+      
+      if (!confirmed) {
+        return; // User cancelled
+      }
+      
+      // Clear chat history if user confirmed
+      setChatHistory([]);
+      setResponse(''); // Clear current response
+      localStorage.removeItem('chatHistory');
+    }
+  
+    try {
+      const dirHandle = await window.showDirectoryPicker();
+      const structure = await readDirectory(dirHandle);
+      setFileStructure([structure]);
+      
+      // Clear selected file and content
+      setSelectedFile(null);
+      setFileContent('');
+    } catch (error) {
+      console.error('Error accessing directory:', error);
+    }
+  };
+
+  const readFileContent = async (fileHandle: FileSystemFileHandle): Promise<string> => {
+    try {
+      const file = await fileHandle.getFile();
+      const content = await file.text();
+      return content;
+    } catch (error) {
+      console.error('Error reading file:', error);
+      return '';
+    }
+  };
+
+  const readDirectory = async (
+    dirHandle: FileSystemDirectoryHandle,
+    path = ''
+  ): Promise<FileStructure> => {
+    const entries: FileStructure[] = [];
+    
+    for await (const entry of dirHandle.values()) {
+      if (entry.kind === 'directory') {
+        const subDir = await readDirectory(
+          await dirHandle.getDirectoryHandle(entry.name),
+          `${path}/${entry.name}`
+        );
+        entries.push(subDir);
+      } else if (entry.kind === 'file') {
+        const fileHandle = await dirHandle.getFileHandle(entry.name);
+        const content = await readFileContent(fileHandle);
+        entries.push({
+          name: entry.name,
+          type: 'file',
+          path: `${path}/${entry.name}`,
+          content
+        });
+      }
+    }
+
+    return {
+      name: dirHandle.name,
+      type: 'directory',
+      path,
+      children: entries.sort((a, b) => {
+        if (a.type === 'directory' && b.type === 'file') return -1;
+        if (a.type === 'file' && b.type === 'directory') return 1;
+        return a.name.localeCompare(b.name);
+      })
+    };
+  };
+
+  const FileTree = ({ item, level = 0 }: { item: FileStructure; level?: number }) => {
+    const [isOpen, setIsOpen] = useState(true);
+    const paddingLeft = `${level * 20}px`;
+
+    const handleFileClick = (file: FileStructure) => {
+      setSelectedFile(file);
+      if (file.content) {
+        setFileContent(file.content);
+      }
+    };
+
+    if (item.type === 'file') {
+      const isSelected = selectedFile?.path === item.path;
+      return (
+        <div
+          className={`py-1 cursor-pointer hover:bg-gray-100 ${
+            isSelected ? 'bg-blue-50' : ''
+          }`}
+          style={{ paddingLeft }}
+          onClick={() => handleFileClick(item)}
+        >
+          <div className="flex items-center">
+            <File className="w-4 h-4 mr-2 text-gray-500" />
+            <span className="text-sm text-gray-700">{item.name}</span>
+          </div>
+        </div>
+      );
+    }
+
+    return (
+      <div>
+        <div
+          className="py-1 cursor-pointer hover:bg-gray-100"
+          style={{ paddingLeft }}
+          onClick={() => setIsOpen(!isOpen)}
+        >
+          <div className="flex items-center">
+            {isOpen ? (
+              <ChevronDown className="w-4 h-4 mr-2 text-gray-500" />
+            ) : (
+              <ChevronRight className="w-4 h-4 mr-2 text-gray-500" />
+            )}
+            <FolderOpen className="w-4 h-4 mr-2 text-blue-500" />
+            <span className="text-sm font-medium text-gray-800">{item.name}</span>
+          </div>
+        </div>
+        {isOpen && item.children && (
+          <div>
+            {item.children.map((child, index) => (
+              <FileTree key={`${child.path}-${index}`} item={child} level={level + 1} />
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const callOpenAI = async (promptText: string, codeContent: string) => {
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKeys.openai}`
+      },
+      body: JSON.stringify({
+        model: 'gpt-4-turbo-preview',
+        messages: [
+          {
+            role: 'system',
+            content: 'You are an expert programming assistant. Analyze code and provide helpful suggestions.'
+          },
+          {
+            role: 'user',
+            content: `Code:\n\`\`\`\n${codeContent}\n\`\`\`\n\nQuestion: ${promptText}`
+          }
+        ]
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error('OpenAI API call failed');
+    }
+
+    const data = await response.json();
+    return data.choices[0].message.content;
+  };
+
+  const callClaude = async (promptText: string, codeContent: string) => {
+    if (!apiKeys.claude) {
+      throw new Error('Claude API key is missing');
+    }
+  
+    console.log('Making request to Claude API...'); // Debug log
+  
+    const requestBody = {
+      model: 'claude-3-sonnet-20240229',
+      messages: [{
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: `Analyze this code and answer the following question:\n\nCode:\n${codeContent}\n\nQuestion: ${promptText}`
+          }
+        ]
+      }],
+      max_tokens: 1500,
+      temperature: 0.7
+    };
+  
+    try {
+      console.log('Request body:', JSON.stringify(requestBody, null, 2));
+  
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': apiKeys.claude,
+          'anthropic-version': '2024-02-29'
+        },
+        body: JSON.stringify(requestBody)
+      });
+  
+      console.log('Response status:', response.status); // Debug log
+  
+      const responseText = await response.text();
+      console.log('Raw response:', responseText); // Debug log
+  
+      if (!response.ok) {
+        console.error('Response not OK:', response.status, responseText);
+        throw new Error(`API request failed: ${response.status} ${responseText}`);
+      }
+  
+      let data;
+      try {
+        data = JSON.parse(responseText);
+      } catch (e) {
+        throw new Error('Failed to parse API response');
+      }
+  
+      if (!data.content || !Array.isArray(data.content) || !data.content[0]?.text) {
+        console.error('Unexpected response structure:', data);
+        throw new Error('Invalid API response structure');
+      }
+  
+      return data.content[0].text;
+    } catch (error) {
+      console.error('Detailed error:', {
+        //message: error.message,
+        //stack: error.stack,
+        //cause: error.cause
+      });
+      
+      if (error instanceof Response) {
+        const errorText = await error.text();
+        throw new Error(`Claude API Response Error: ${errorText}`);
+      }
+      
+      //throw new Error(`Claude API Error: ${error.message || 'Unknown error occurred'}`);
+    }
+  };
+
+  const handleSubmit = async () => {
+    if (!prompt.trim()) {
+      alert('Please enter a prompt');
+      return;
+    }
+    if (!selectedFile?.content) {
+      alert('Please select a file first');
+      return;
+    }
+    
+    const currentApiKey = selectedService === 'openai' ? apiKeys.openai : apiKeys.claude;
+    if (!currentApiKey) {
+      setShowSettings(true);
+      return;
+    }
+  
+    setLoading(true);
+  
+    try {
+      const result = await (selectedService === 'openai' 
+        ? callOpenAI(prompt, selectedFile.content)
+        : callClaude(prompt, selectedFile.content)
+      );
+      
+      // Create new chat message
+      const newMessage: ChatMessage = {
+        id: Date.now().toString(),
+        timestamp: new Date().toISOString(),
+        prompt,
+        response: result,
+        filePath: selectedFile.path
+      };
+  
+      // Update chat history
+      const updatedHistory = [...chatHistory, newMessage];
+      setChatHistory(updatedHistory);
+      
+      // Save to localStorage
+      localStorage.setItem('chatHistory', JSON.stringify(updatedHistory));
+      
+      setResponse(result);
+      setPrompt('');
+    } catch (error) {
+      setResponse('Error: ' + error.message);
+      if (error.message.includes('API key')) {
+        setShowSettings(true);
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const clearChatHistory = () => {
+    if (window.confirm('Are you sure you want to clear the chat history?')) {
+      setChatHistory([]);
+      localStorage.removeItem('chatHistory');
+    }
+  };
+
+  const handleSaveSettings = (openaiKey: string, claudeKey: string) => {
+    const newApiKeys = {
+      openai: openaiKey,
+      claude: claudeKey
+    };
+    setApiKeys(newApiKeys);
+    localStorage.setItem('openai_api_key', openaiKey);
+    localStorage.setItem('claude_api_key', claudeKey);
+    setShowSettings(false);
+  };
+
+  const SettingsModal = () => {
+    const [openaiKey, setOpenaiKey] = useState(apiKeys.openai);
+    const [claudeKey, setClaudeKey] = useState(apiKeys.claude);
+
+    return (
+      <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+        <div className="bg-white rounded-lg p-6 w-96">
+          <h2 className="text-xl font-bold mb-4">API Settings</h2>
+          <div className="space-y-4">
+            <div>
+              <label className="block text-sm font-medium mb-1">OpenAI API Key</label>
+              <input
+                type="password"
+                value={openaiKey}
+                onChange={(e) => setOpenaiKey(e.target.value)}
+                className="w-full px-3 py-2 border rounded"
+                placeholder="sk-..."
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1">Claude API Key</label>
+              <input
+                type="password"
+                value={claudeKey}
+                onChange={(e) => setClaudeKey(e.target.value)}
+                className="w-full px-3 py-2 border rounded"
+                placeholder="sk-..."
+              />
+            </div>
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => setShowSettings(false)}
+                className="px-4 py-2 text-gray-600 hover:bg-gray-100 rounded"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => handleSaveSettings(openaiKey, claudeKey)}
+                className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
+              >
+                Save
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div className="min-h-screen bg-gray-100 flex flex-col">
+      {/* Header */}
+      <header className="bg-white shadow">
+        <div className="max-w-7xl mx-auto px-4 py-4">
+          <h1 className="text-2xl font-bold text-gray-800">AI Code Editor</h1>
+        </div>
+      </header>
+  
+      {/* Main Content */}
+      <div className="flex-1 flex">
+        {/* File Explorer - 20% */}
+        <div className="w-1/5 bg-white shadow-sm border-r">
+          <div className="p-4">
+            <button
+              onClick={handleDirectorySelect}
+              className="w-full flex items-center justify-center px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 transition-colors"
+            >
+              <FolderOpen className="w-4 h-4 mr-2" />
+              Open Folder
+            </button>
+          </div>
+          <div className="overflow-auto max-h-[calc(100vh-8rem)]">
+            {fileStructure.map((item, index) => (
+              <FileTree key={`${item.path}-${index}`} item={item} />
+            ))}
+          </div>
+        </div>
+  
+        {/* Code Editor - 50% */}
+        <div className="w-1/2 flex flex-col">
+          <div className="flex-1 bg-white p-4">
+            <div className="h-full border rounded-lg bg-gray-50 p-4 overflow-auto">
+              {selectedFile ? (
+                <pre className="whitespace-pre-wrap text-sm font-mono">
+                  {fileContent}
+                </pre>
+              ) : (
+                <p className="text-center text-gray-500 mt-8">
+                  Select a file to view its contents
+                </p>
+              )}
+            </div>
+          </div>
+        </div>
+      {/* Chat Panel - 30% with fixed width */}
+<div className="w-[30%] border-l border-gray-200 bg-white flex flex-col overflow-hidden">
+  {/* Chat History with proper width constraints */}
+  <div className="flex-1 overflow-auto p-4">
+    {chatHistory.map((chat) => (
+      <div key={chat.id} className="mb-4 last:mb-0">
+        <div className="bg-gray-50 rounded-lg p-3 mb-2 break-words">
+          <div className="text-xs text-gray-500 mb-1">
+            {new Date(chat.timestamp).toLocaleString()}
+            {chat.filePath && (
+              <span className="ml-2 text-blue-500">
+                {chat.filePath.split('/').pop()}
+              </span>
+            )}
+          </div>
+          <div className="text-sm font-medium">{chat.prompt}</div>
+        </div>
+        <div className="bg-blue-50 rounded-lg p-3">
+          <pre className="whitespace-pre-wrap text-sm break-words max-w-full">
+            {chat.response}
+          </pre>
+        </div>
+      </div>
+    ))}
+  </div>
+
+  {/* Current response display */}
+  {response && (
+    <div className="px-4 mb-4">
+      <div className="bg-blue-50 rounded-lg p-3">
+        <pre className="whitespace-pre-wrap text-sm break-words max-w-full overflow-x-auto">
+          {response}
+        </pre>
+      </div>
+    </div>
+  )}
+
+  {/* AI Controls - keep at bottom */}
+  <div className="border-t p-4">
+    <div className="flex items-center gap-4 mb-4">
+      <div className="flex items-center gap-2">
+        <input
+          type="radio"
+          id="claude"
+          name="ai-service"
+          value="claude"
+          checked={selectedService === 'claude'}
+          onChange={(e) => setSelectedService(e.target.value as AIService)}
+        />
+        <label htmlFor="claude">Claude</label>
+      </div>
+      <div className="flex items-center gap-2">
+        <input
+          type="radio"
+          id="openai"
+          name="ai-service"
+          value="openai"
+          checked={selectedService === 'openai'}
+          onChange={(e) => setSelectedService(e.target.value as AIService)}
+        />
+        <label htmlFor="openai">OpenAI</label>
+      </div>
+      <button
+        onClick={() => setShowSettings(true)}
+        className="ml-auto p-2 text-gray-500 hover:text-gray-700"
+        title="API Settings"
+      >
+        <Settings className="w-5 h-5" />
+      </button>
+    </div>
+
+    <div className="flex flex-col gap-2">
+      <textarea
+        value={prompt}
+        onChange={(e) => setPrompt(e.target.value)}
+        placeholder={`Ask ${selectedService === 'openai' ? 'GPT-4' : 'Claude'} about the code...`}
+        className="w-full px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none"
+        rows={3}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            handleSubmit();
+          }
+        }}
+      />
+      <button
+        onClick={handleSubmit}
+        disabled={loading}
+        className="w-full px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors disabled:bg-blue-300"
+      >
+        {loading ? (
+          <span className="animate-pulse">Processing...</span>
+        ) : (
+          <div className="flex items-center justify-center">
+            <Send className="w-4 h-4 mr-2" />
+            Send
+          </div>
+        )}
+      </button>
+    </div>
+  </div>
+</div>
+        
+      </div>
+  
+      {/* Settings Modal */}
+      {showSettings && <SettingsModal />}
+    </div>
+  );
+}
+
+export default App;
